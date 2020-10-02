@@ -26,6 +26,7 @@ const (
 	roleNameAttr              = "name"
 	rolePasswordAttr          = "password"
 	roleReplicationAttr       = "replication"
+	roleSetRoleTo             = "set_role_to"
 	roleSkipDropRoleAttr      = "skip_drop_role"
 	roleSkipReassignOwnedAttr = "skip_reassign_owned"
 	roleSuperuserAttr         = "superuser"
@@ -135,6 +136,12 @@ func resourcePostgreSQLRole() *schema.Resource {
 				Optional:    true,
 				Default:     false,
 				Description: "Determine whether a role is allowed to initiate streaming replication or put the system in and out of backup mode",
+			},
+			roleSetRoleTo: {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Default:     "",
+				Description: "Sets a default role to assume on login",
 			},
 			roleBypassRLSAttr: {
 				Type:        schema.TypeBool,
@@ -287,6 +294,10 @@ func resourcePostgreSQLRoleCreate(d *schema.ResourceData, meta interface{}) erro
 	}
 
 	if err = alterSearchPath(txn, d); err != nil {
+		return err
+	}
+
+	if err = setSetRoleTo(txn, d); err != nil {
 		return err
 	}
 
@@ -447,6 +458,7 @@ func resourcePostgreSQLRoleReadImpl(c *Client, d *schema.ResourceData) error {
 	d.Set(roleBypassRLSAttr, roleBypassRLS)
 	d.Set(roleRolesAttr, pgArrayToSet(roleRoles))
 	d.Set(roleSearchPathAttr, readSearchPath(roleConfig))
+	d.Set(roleSetRoleTo, readSetRoleTo(roleConfig))
 
 	statementTimeout, err := readStatementTimeout(roleConfig)
 	if err != nil {
@@ -477,6 +489,18 @@ func readSearchPath(roleConfig pq.ByteaArray) []string {
 		}
 	}
 	return nil
+}
+
+// readSetRoleTo searches for a role entry in the rolconfig array. It returns
+// an empty string if the value is not present.
+func readSetRoleTo(roleConfig pq.ByteaArray) string {
+	for _, v := range roleConfig {
+		config := string(v)
+		if strings.HasPrefix(config, "role") {
+			return strings.Split(strings.TrimPrefix(config, "role="), ", ")[0]
+		}
+	}
+	return ""
 }
 
 // readStatementTimeout searches for a statement_timeout entry in the rolconfig array.
@@ -620,6 +644,10 @@ func resourcePostgreSQLRoleUpdate(d *schema.ResourceData, meta interface{}) erro
 	}
 
 	if err = alterSearchPath(txn, d); err != nil {
+		return err
+	}
+
+	if err = setSetRoleTo(txn, d); err != nil {
 		return err
 	}
 
@@ -880,6 +908,37 @@ func revokeRoles(txn *sql.Tx, d *schema.ResourceData) error {
 		if _, err := txn.Exec(query); err != nil {
 			return fmt.Errorf("could not revoke role %s from %s: %w", string(grantedRole), role, err)
 		}
+	}
+
+	return nil
+}
+
+func hasRole(d *schema.ResourceData, roleName string) bool {
+	for _, role := range d.Get("roles").(*schema.Set).List() {
+		if roleName == role {
+			return true
+		}
+	}
+	return false
+}
+
+func setSetRoleTo(txn *sql.Tx, d *schema.ResourceData) error {
+	if !d.HasChange(roleSetRoleTo) {
+		return nil
+	}
+
+	setRoleTo := d.Get(roleSetRoleTo).(string)
+	roleName := d.Get(roleNameAttr).(string)
+	sql := fmt.Sprintf("ALTER ROLE %s RESET ROLE", pq.QuoteIdentifier(roleName))
+	if len(setRoleTo) > 0 {
+		if !hasRole(d, setRoleTo) {
+			return fmt.Errorf("Error updating role SET ROLE TO: The user does not have the '%s' role", roleName)
+		}
+		sql = fmt.Sprintf("ALTER ROLE %s SET ROLE TO %s", pq.QuoteIdentifier(roleName), pq.QuoteIdentifier(setRoleTo))
+	}
+
+	if _, err := txn.Exec(sql); err != nil {
+		return fmt.Errorf("Error updating role SET ROLE TO: %w", err)
 	}
 
 	return nil
